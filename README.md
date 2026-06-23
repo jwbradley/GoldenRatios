@@ -134,6 +134,18 @@ python3 gsr_data_collector.py --status
 
 Shows total records, date range, latest values, and file size.
 
+### Export to CSV (for spreadsheet analysis)
+
+```bash
+# Default (saves to gsr_history.csv in same directory)
+python3 gsr_data_collector.py --csv
+
+# Custom output path
+python3 gsr_data_collector.py --csv ~/Documents/gold_silver_history.csv
+```
+
+Columns: `date, gold, silver, gsr`
+
 ---
 
 ## Cron Setup
@@ -293,7 +305,15 @@ python3 market_ratios_collector.py --status
 
 # Output briefing snippet (markdown, for market reports)
 python3 market_ratios_collector.py --briefing
+
+# Export to CSV (for spreadsheet analysis)
+python3 market_ratios_collector.py --csv
+
+# Export to specific path
+python3 market_ratios_collector.py --csv ~/Documents/market_ratios.csv
 ```
+
+CSV columns: `date, gold, silver, dow, sp500, gsr, dow_gold, sp500_gold`
 
 ### Data Collected
 

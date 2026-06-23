@@ -206,6 +206,28 @@ def print_record(r):
     print(f"[{LOG_PREFIX}] {' | '.join(parts)}")
 
 
+def export_csv(output_path=None):
+    """Export history to CSV file for spreadsheet use."""
+    import csv
+
+    history = load_history()
+    if not history:
+        print("No history file found. Run with --backfill first.")
+        return
+
+    if not output_path:
+        output_path = os.path.join(DATA_DIR, 'market_ratios_history.csv')
+
+    fieldnames = ['date', 'gold', 'silver', 'dow', 'sp500', 'gsr', 'dow_gold', 'sp500_gold']
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+    print(f"[{LOG_PREFIX}] Exported {len(history)} records to {output_path}")
+
+
 def show_status():
     """Display current data status."""
     history = load_history()
@@ -299,6 +321,8 @@ Examples:
   Daily cron update:     python3 market_ratios_collector.py
   Check status:          python3 market_ratios_collector.py --status
   Briefing output:       python3 market_ratios_collector.py --briefing
+  Export to CSV:         python3 market_ratios_collector.py --csv
+  Export to path:        python3 market_ratios_collector.py --csv /path/to/output.csv
         """
     )
     parser.add_argument('--backfill', action='store_true',
@@ -309,6 +333,8 @@ Examples:
                         help='Show current data status and exit')
     parser.add_argument('--briefing', action='store_true',
                         help='Output market briefing summary (for inclusion in reports)')
+    parser.add_argument('--csv', nargs='?', const='', default=None,
+                        help='Export history to CSV (optional: specify output path)')
 
     args = parser.parse_args()
 
@@ -318,6 +344,10 @@ Examples:
 
     if args.briefing:
         show_briefing()
+        return
+
+    if args.csv is not None:
+        export_csv(args.csv if args.csv else None)
         return
 
     if args.backfill:

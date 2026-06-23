@@ -177,6 +177,26 @@ def daily_update(fred):
         print(f"[{LOG_PREFIX}] No new data available from FRED yet.")
 
 
+def export_csv(output_path=None):
+    """Export history to CSV file for spreadsheet use."""
+    import csv
+
+    history = load_history()
+    if not history:
+        print("No history file found. Run with --backfill first.")
+        return
+
+    if not output_path:
+        output_path = os.path.join(DATA_DIR, 'gsr_history.csv')
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['date', 'gold', 'silver', 'gsr'])
+        writer.writeheader()
+        writer.writerows(history)
+
+    print(f"[{LOG_PREFIX}] Exported {len(history)} records to {output_path}")
+
+
 def show_status():
     """Display current data status."""
     history = load_history()
@@ -208,6 +228,8 @@ Examples:
   Daily cron update:          python3 gsr_data_collector.py
   Custom start date:          python3 gsr_data_collector.py --backfill --start 2000-01-01
   Check status:               python3 gsr_data_collector.py --status
+  Export to CSV:              python3 gsr_data_collector.py --csv
+  Export to specific path:    python3 gsr_data_collector.py --csv /path/to/output.csv
   Last 10 years only:         python3 gsr_data_collector.py --backfill --start 2016-01-01
         """
     )
@@ -217,11 +239,17 @@ Examples:
                         help=f'Start date for backfill (default: {DEFAULT_START})')
     parser.add_argument('--status', action='store_true',
                         help='Show current data status and exit')
+    parser.add_argument('--csv', nargs='?', const='', default=None,
+                        help='Export history to CSV (optional: specify output path)')
 
     args = parser.parse_args()
 
     if args.status:
         show_status()
+        return
+
+    if args.csv is not None:
+        export_csv(args.csv if args.csv else None)
         return
 
     fred = get_fred_client()

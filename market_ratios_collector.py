@@ -102,7 +102,9 @@ def fetch_data(start_date, end_date=None):
     df = df.dropna(subset=['gold'])
 
     # Drop rows where ALL other columns are NaN
-    df = df.dropna(how='all', subset=['silver', 'dow', 'sp500'])
+    other_cols = [c for c in ['silver', 'dow', 'sp500'] if c in df.columns]
+    if other_cols:
+        df = df.dropna(how='all', subset=other_cols)
 
     if df.empty:
         print(f"[{LOG_PREFIX}] No overlapping data available for the requested range.")
@@ -112,9 +114,9 @@ def fetch_data(start_date, end_date=None):
     records = []
     for date, row in df.iterrows():
         gold = float(row['gold'])
-        silver = float(row['silver']) if pd.notna(row['silver']) else None
-        dow = float(row['dow']) if pd.notna(row['dow']) else None
-        sp500 = float(row['sp500']) if pd.notna(row['sp500']) else None
+        silver = float(row.get('silver')) if 'silver' in row.index and pd.notna(row.get('silver')) else None
+        dow = float(row.get('dow')) if 'dow' in row.index and pd.notna(row.get('dow')) else None
+        sp500 = float(row.get('sp500')) if 'sp500' in row.index and pd.notna(row.get('sp500')) else None
 
         record = {
             'date': date.strftime('%Y-%m-%d'),

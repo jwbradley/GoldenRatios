@@ -1,237 +1,325 @@
 #!/usr/bin/env python3
 """
 Market Ratios Data Collector
-Pulls daily gold, silver, Dow, and S&P 500 prices from Yahoo Finance
+
+Pulls daily gold, silver, Dow, and S&P 500 prices (Yahoo Finance / yfinance)
 and calculates GSR, Dow/Gold, and S&P/Gold ratios.
 
-First run: Downloads full history back to 2000 (or specified start date)
-Subsequent runs: Appends only new data points since last collection
+First run:  python3 market_ratios_collector.py --backfill
+Daily:      python3 market_ratios_collector.py
+Briefing:   python3 market_ratios_collector.py --briefing
 
-Setup:
-  1. pip install yfinance pandas
-  2. Run once to pull historical data: python3 market_ratios_collector.py --backfill
-  3. Add to crontab for daily updates: python3 market_ratios_collector.py
+Environment:
+  MARKET_RATIOS_DIR or GSR_DATA_DIR  — output directory (default: script dir)
 
-Crontab example (run at 5:30 PM CT Monday-Friday, after markets close):
-  30 17 * * 1-5 /usr/bin/python3 /home/pi/scripts/market_ratios_collector.py >> /home/pi/logs/market_ratios.log 2>&1
+Crontab example (after US equity close, weekdays):
+  30 17 * * 1-5 /path/to/.venv/bin/python /path/to/market_ratios_collector.py
 
-Output:
-  - market_ratios_history.json: Full price history with all ratios
-  - market_ratios_latest.json: Most recent data point only
+Educational / informational use only — see DISCLAIMER.md.
+
+Includes holiday-safe handling when some symbols have no row for a session
+(e.g. prior day was a scheduled market holiday).
 """
 
+from __future__ import annotations
+
+import argparse
+import csv
 import json
 import os
 import sys
-import argparse
+import tempfile
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
 
 try:
-    import yfinance as yf
     import pandas as pd
+    import yfinance as yf
 except ImportError:
-    print("ERROR: Required packages not installed.")
-    print("Run: pip install yfinance pandas")
+    print("ERROR: Required packages not installed.", file=sys.stderr)
+    print("Run: pip install yfinance pandas", file=sys.stderr)
     sys.exit(1)
 
-# Symbols
 SYMBOLS = {
-    'gold': 'GC=F',       # Gold Futures (CME)
-    'silver': 'SI=F',     # Silver Futures (CME)
-    'dow': '^DJI',        # Dow Jones Industrial Average
-    'sp500': '^GSPC',     # S&P 500 Index
+    "gold": "GC=F",
+    "silver": "SI=F",
+    "dow": "^DJI",
+    "sp500": "^GSPC",
 }
 
-DEFAULT_START = '2000-01-01'
+DEFAULT_START = "2000-01-01"
+MAX_RETRIES = 3
+RETRY_SLEEP_SEC = 2.0
 
-# File paths
-DATA_DIR = os.environ.get('MARKET_RATIOS_DIR',
-           os.environ.get('GSR_DATA_DIR',
-           os.path.dirname(os.path.abspath(__file__))))
-HISTORY_FILE = os.path.join(DATA_DIR, 'market_ratios_history.json')
-LATEST_FILE = os.path.join(DATA_DIR, 'market_ratios_latest.json')
-LOG_PREFIX = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(
+    os.environ.get(
+        "MARKET_RATIOS_DIR",
+        os.environ.get("GSR_DATA_DIR", str(SCRIPT_DIR)),
+    )
+)
+HISTORY_FILE = DATA_DIR / "market_ratios_history.json"
+LATEST_FILE = DATA_DIR / "market_ratios_latest.json"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE = LOG_DIR / "market_ratios.log"
 
 
-def load_history():
-    """Load existing history from JSON file."""
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, 'r') as f:
+def log(msg: str) -> None:
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    ensure_data_dir()
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_history() -> list[dict]:
+    if HISTORY_FILE.is_file():
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return []
 
 
-def save_history(data):
-    """Save history to JSON file."""
-    with open(HISTORY_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"[{LOG_PREFIX}] Saved {len(data)} records to {HISTORY_FILE}")
+def save_history(data: list[dict]) -> None:
+    atomic_write_json(HISTORY_FILE, data)
+    log(f"Saved {len(data)} records to {HISTORY_FILE}")
 
 
-def save_latest(record):
-    """Save the most recent data point for quick access."""
-    with open(LATEST_FILE, 'w') as f:
-        json.dump(record, f, indent=2)
+def save_latest(record: dict) -> None:
+    atomic_write_json(LATEST_FILE, record)
 
 
-def fetch_data(start_date, end_date=None):
-    """Fetch all market data from Yahoo Finance for the given date range."""
-    print(f"[{LOG_PREFIX}] Fetching data from {start_date} to {end_date or 'today'}...")
+def _download_close(symbol: str, start_date: str, end: str) -> pd.Series:
+    """Download close with simple retries; empty Series on failure."""
+    last_err: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            hist = yf.Ticker(symbol).history(start=start_date, end=end, auto_adjust=True)
+            if hist is None or hist.empty or "Close" not in hist.columns:
+                raise ValueError(f"empty history for {symbol}")
+            s = hist["Close"].copy()
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            s.name = symbol
+            return s
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_SLEEP_SEC * attempt)
+    log(f"  WARNING: No data for {symbol} after {MAX_RETRIES} tries ({last_err})")
+    return pd.Series(dtype=float)
 
-    end = end_date or (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
-    # Download all symbols
-    frames = {}
+def fetch_data(start_date: str, end_date: Optional[str] = None) -> list[dict]:
+    """Fetch all market data and compute ratios for the date range."""
+    log(f"Fetching data from {start_date} to {end_date or 'today'}...")
+    end = end_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    frames: dict[str, pd.Series] = {}
     for name, symbol in SYMBOLS.items():
-        print(f"[{LOG_PREFIX}]   Downloading {name} ({symbol})...")
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(start=start_date, end=end)
-        if hist.empty:
-            print(f"[{LOG_PREFIX}]   WARNING: No data for {symbol}")
-            continue
-        frames[name] = hist['Close'].rename(name)
+        log(f"  Downloading {name} ({symbol})...")
+        series = _download_close(symbol, start_date, end)
+        if not series.empty:
+            frames[name] = series.rename(name)
 
-    if not frames:
-        print(f"[{LOG_PREFIX}] ERROR: No data returned from any source.")
+    if "gold" not in frames:
+        log("ERROR: No gold data — cannot compute ratios.")
         return []
 
-    # Combine into single DataFrame aligned on date
     df = pd.DataFrame(frames)
+    df = df.dropna(subset=["gold"])
 
-    # Drop rows where gold is missing (needed for all ratios)
-    df = df.dropna(subset=['gold'])
-
-    # Drop rows where ALL other columns are NaN
-    other_cols = [c for c in ['silver', 'dow', 'sp500'] if c in df.columns]
+    # Holiday / partial-session safe: only drop rows where every non-gold field is NaN,
+    # and only among columns that actually exist (avoids KeyError when a symbol is missing).
+    other_cols = [c for c in ("silver", "dow", "sp500") if c in df.columns]
     if other_cols:
-        df = df.dropna(how='all', subset=other_cols)
+        df = df.dropna(how="all", subset=other_cols)
 
     if df.empty:
-        print(f"[{LOG_PREFIX}] No overlapping data available for the requested range.")
+        log("No overlapping data available for the requested range.")
         return []
 
-    # Calculate ratios
-    records = []
+    records: list[dict] = []
     for date, row in df.iterrows():
-        gold = float(row['gold'])
-        silver = float(row.get('silver')) if 'silver' in row.index and pd.notna(row.get('silver')) else None
-        dow = float(row.get('dow')) if 'dow' in row.index and pd.notna(row.get('dow')) else None
-        sp500 = float(row.get('sp500')) if 'sp500' in row.index and pd.notna(row.get('sp500')) else None
+        gold = float(row["gold"])
+        silver = (
+            float(row["silver"])
+            if "silver" in row.index and pd.notna(row.get("silver"))
+            else None
+        )
+        dow = float(row["dow"]) if "dow" in row.index and pd.notna(row.get("dow")) else None
+        sp500 = (
+            float(row["sp500"])
+            if "sp500" in row.index and pd.notna(row.get("sp500"))
+            else None
+        )
 
-        record = {
-            'date': date.strftime('%Y-%m-%d'),
-            'gold': round(gold, 2),
-            'silver': round(silver, 4) if silver else None,
-            'dow': round(dow, 2) if dow else None,
-            'sp500': round(sp500, 2) if sp500 else None,
-            'gsr': round(gold / silver, 4) if silver and silver > 0 else None,
-            'dow_gold': round(dow / gold, 4) if dow and gold > 0 else None,
-            'sp500_gold': round(sp500 / gold, 4) if sp500 and gold > 0 else None,
-        }
-        records.append(record)
+        records.append(
+            {
+                "date": pd.Timestamp(date).strftime("%Y-%m-%d"),
+                "gold": round(gold, 2),
+                "silver": round(silver, 4) if silver is not None else None,
+                "dow": round(dow, 2) if dow is not None else None,
+                "sp500": round(sp500, 2) if sp500 is not None else None,
+                "gsr": round(gold / silver, 4) if silver and silver > 0 else None,
+                "dow_gold": round(dow / gold, 4) if dow and gold > 0 else None,
+                "sp500_gold": round(sp500 / gold, 4) if sp500 and gold > 0 else None,
+            }
+        )
 
-    print(f"[{LOG_PREFIX}] Fetched {len(records)} data points.")
+    partial = sum(1 for r in records if r.get("dow") is None or r.get("sp500") is None)
+    if partial:
+        log(
+            f"WARNING: {partial}/{len(records)} rows missing Dow and/or S&P "
+            "(ratios null where missing)."
+        )
+
+    log(f"Fetched {len(records)} data points.")
     return records
 
 
-def backfill(start_date=DEFAULT_START):
-    """Pull full historical data from start_date to today."""
-    print(f"[{LOG_PREFIX}] BACKFILL: Pulling full history from {start_date}...")
+def backfill(start_date: str = DEFAULT_START) -> list[dict]:
+    log(f"BACKFILL: Pulling full history from {start_date}...")
     records = fetch_data(start_date)
-
     if records:
         save_history(records)
         save_latest(records[-1])
-        print(f"[{LOG_PREFIX}] Backfill complete: {len(records)} records")
-        print(f"[{LOG_PREFIX}]   First: {records[0]['date']}")
-        print(f"[{LOG_PREFIX}]   Last:  {records[-1]['date']}")
+        log(f"Backfill complete: {len(records)} records")
+        log(f"  First: {records[0]['date']}")
+        log(f"  Last:  {records[-1]['date']}")
         print_record(records[-1])
     else:
-        print(f"[{LOG_PREFIX}] ERROR: No data returned.")
-
+        log("ERROR: No data returned.")
     return records
 
 
-def daily_update():
-    """Append new data points since last collection."""
+def daily_update() -> None:
     history = load_history()
-
     if not history:
-        print(f"[{LOG_PREFIX}] No existing history found. Run with --backfill first.")
+        log("No existing history found. Run with --backfill first.")
         sys.exit(1)
 
-    last_date = history[-1]['date']
-    start = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    last_date = history[-1]["date"]
+    latest = history[-1]
+    incomplete = any(
+        latest.get(k) is None
+        for k in ("silver", "dow", "sp500", "gsr", "dow_gold", "sp500_gold")
+    )
 
-    if start > datetime.now().strftime('%Y-%m-%d'):
-        print(f"[{LOG_PREFIX}] Already up to date (last record: {last_date}). Nothing to fetch.")
+    # Always re-fetch a trailing window so late index prints and nulls can be filled,
+    # even when the latest date is already "today".
+    overlap_start = (datetime.strptime(last_date, "%Y-%m-%d") - timedelta(days=10)).strftime(
+        "%Y-%m-%d"
+    )
+    reason = "incomplete latest row" if incomplete else "overlap refresh"
+    log(f"DAILY UPDATE: Fetching from {overlap_start} (last record: {last_date}, {reason})...")
+    new_records = fetch_data(overlap_start)
+
+    if not new_records:
+        log("No new data available yet.")
         return
 
-    print(f"[{LOG_PREFIX}] DAILY UPDATE: Fetching from {start} (last record: {last_date})...")
-    new_records = fetch_data(start)
-
-    if new_records:
-        existing_dates = {r['date'] for r in history}
-        new_unique = [r for r in new_records if r['date'] not in existing_dates]
-
-        if new_unique:
-            history.extend(new_unique)
-            history.sort(key=lambda x: x['date'])
-            save_history(history)
-            save_latest(history[-1])
-            print(f"[{LOG_PREFIX}] Added {len(new_unique)} new records (total: {len(history)})")
-            for r in new_unique:
-                print_record(r)
+    by_date = {r["date"]: r for r in history}
+    added = 0
+    updated = 0
+    for r in new_records:
+        prev = by_date.get(r["date"])
+        if prev is None:
+            by_date[r["date"]] = r
+            added += 1
         else:
-            print(f"[{LOG_PREFIX}] No new unique records to add.")
+            # Prefer non-null fields when refreshing an existing day
+            merged = dict(prev)
+            for k, v in r.items():
+                if v is not None:
+                    merged[k] = v
+            g, s, d, sp = (
+                merged.get("gold"),
+                merged.get("silver"),
+                merged.get("dow"),
+                merged.get("sp500"),
+            )
+            if g and s and s > 0:
+                merged["gsr"] = round(g / s, 4)
+            if g and d and g > 0:
+                merged["dow_gold"] = round(d / g, 4)
+            if g and sp and g > 0:
+                merged["sp500_gold"] = round(sp / g, 4)
+            if merged != prev:
+                by_date[r["date"]] = merged
+                updated += 1
+
+    if added or updated:
+        history = sorted(by_date.values(), key=lambda x: x["date"])
+        save_history(history)
+        save_latest(history[-1])
+        log(f"Added {added}, updated {updated} (total: {len(history)})")
+        if history:
+            print_record(history[-1])
     else:
-        print(f"[{LOG_PREFIX}] No new data available yet.")
+        log("No new unique records to add.")
 
 
-def print_record(r):
-    """Print a single record in readable format."""
+def print_record(r: dict) -> None:
     parts = [f"  {r['date']}:"]
-    if r.get('gold'):
+    if r.get("gold") is not None:
         parts.append(f"Gold=${r['gold']:,.2f}")
-    if r.get('silver'):
+    if r.get("silver") is not None:
         parts.append(f"Silver=${r['silver']:.2f}")
-    if r.get('dow'):
+    if r.get("dow") is not None:
         parts.append(f"Dow={r['dow']:,.2f}")
-    if r.get('sp500'):
+    if r.get("sp500") is not None:
         parts.append(f"S&P={r['sp500']:,.2f}")
-    if r.get('gsr'):
+    if r.get("gsr") is not None:
         parts.append(f"GSR={r['gsr']:.1f}")
-    if r.get('dow_gold'):
+    if r.get("dow_gold") is not None:
         parts.append(f"Dow/Gold={r['dow_gold']:.2f}")
-    if r.get('sp500_gold'):
+    if r.get("sp500_gold") is not None:
         parts.append(f"S&P/Gold={r['sp500_gold']:.2f}")
-    print(f"[{LOG_PREFIX}] {' | '.join(parts)}")
+    log(" | ".join(parts))
 
 
-def export_csv(output_path=None):
-    """Export history to CSV file for spreadsheet use."""
-    import csv
-
+def export_csv(output_path: Optional[str] = None) -> None:
     history = load_history()
     if not history:
         print("No history file found. Run with --backfill first.")
         return
 
-    if not output_path:
-        output_path = os.path.join(DATA_DIR, 'market_ratios_history.csv')
-
-    fieldnames = ['date', 'gold', 'silver', 'dow', 'sp500', 'gsr', 'dow_gold', 'sp500_gold']
-
-    with open(output_path, 'w', newline='') as f:
+    path = Path(output_path) if output_path else DATA_DIR / "market_ratios_history.csv"
+    ensure_data_dir()
+    fieldnames = ["date", "gold", "silver", "dow", "sp500", "gsr", "dow_gold", "sp500_gold"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(history)
+    log(f"Exported {len(history)} records to {path}")
 
-    print(f"[{LOG_PREFIX}] Exported {len(history)} records to {output_path}")
 
-
-def show_status():
-    """Display current data status."""
+def show_status() -> None:
     history = load_history()
     if not history:
         print("No history file found. Run with --backfill to initialize.")
@@ -242,32 +330,30 @@ def show_status():
     print(f"Total records: {len(history)}")
     print(f"Date range: {history[0]['date']} to {latest['date']}")
     print(f"\nLatest record ({latest['date']}):")
-    print(f"  Gold:       ${latest['gold']:,.2f}" if latest.get('gold') else "  Gold:       N/A")
-    print(f"  Silver:     ${latest['silver']:.2f}" if latest.get('silver') else "  Silver:     N/A")
-    print(f"  Dow:        {latest['dow']:,.2f}" if latest.get('dow') else "  Dow:        N/A")
-    print(f"  S&P 500:    {latest['sp500']:,.2f}" if latest.get('sp500') else "  S&P 500:    N/A")
-    print(f"  GSR:        {latest['gsr']:.2f}" if latest.get('gsr') else "  GSR:        N/A")
-    print(f"  Dow/Gold:   {latest['dow_gold']:.2f}" if latest.get('dow_gold') else "  Dow/Gold:   N/A")
-    print(f"  S&P/Gold:   {latest['sp500_gold']:.4f}" if latest.get('sp500_gold') else "  S&P/Gold:   N/A")
+    print(f"  Gold:       ${latest['gold']:,.2f}" if latest.get("gold") is not None else "  Gold:       N/A")
+    print(f"  Silver:     ${latest['silver']:.2f}" if latest.get("silver") is not None else "  Silver:     N/A")
+    print(f"  Dow:        {latest['dow']:,.2f}" if latest.get("dow") is not None else "  Dow:        N/A")
+    print(f"  S&P 500:    {latest['sp500']:,.2f}" if latest.get("sp500") is not None else "  S&P 500:    N/A")
+    print(f"  GSR:        {latest['gsr']:.2f}" if latest.get("gsr") is not None else "  GSR:        N/A")
+    print(f"  Dow/Gold:   {latest['dow_gold']:.2f}" if latest.get("dow_gold") is not None else "  Dow/Gold:   N/A")
+    print(f"  S&P/Gold:   {latest['sp500_gold']:.4f}" if latest.get("sp500_gold") is not None else "  S&P/Gold:   N/A")
 
-    file_size = os.path.getsize(HISTORY_FILE)
-    print(f"\nFile size: {file_size / 1024 / 1024:.1f} MB")
+    if HISTORY_FILE.is_file():
+        print(f"\nFile size: {HISTORY_FILE.stat().st_size / 1024 / 1024:.1f} MB")
 
-    # Show ratio trends (last 5 trading days)
     if len(history) >= 5:
-        print(f"\nLast 5 trading days:")
+        print("\nLast 5 trading days:")
         print(f"  {'Date':<12} {'Gold':>10} {'Dow/Gold':>10} {'S&P/Gold':>10} {'GSR':>8}")
-        print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+        print(f"  {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 8}")
         for r in history[-5:]:
-            gold_str = f"${r['gold']:,.0f}" if r.get('gold') else "N/A"
-            dg_str = f"{r['dow_gold']:.2f}" if r.get('dow_gold') else "N/A"
-            sg_str = f"{r['sp500_gold']:.4f}" if r.get('sp500_gold') else "N/A"
-            gsr_str = f"{r['gsr']:.1f}" if r.get('gsr') else "N/A"
+            gold_str = f"${r['gold']:,.0f}" if r.get("gold") is not None else "N/A"
+            dg_str = f"{r['dow_gold']:.2f}" if r.get("dow_gold") is not None else "N/A"
+            sg_str = f"{r['sp500_gold']:.4f}" if r.get("sp500_gold") is not None else "N/A"
+            gsr_str = f"{r['gsr']:.1f}" if r.get("gsr") is not None else "N/A"
             print(f"  {r['date']:<12} {gold_str:>10} {dg_str:>10} {sg_str:>10} {gsr_str:>8}")
 
 
-def show_briefing():
-    """Output a concise summary suitable for inclusion in market briefings."""
+def show_briefing() -> None:
     history = load_history()
     if not history or len(history) < 2:
         print("Insufficient data for briefing. Run --backfill first.")
@@ -279,42 +365,48 @@ def show_briefing():
     print(f"## Market Ratios ({latest['date']})")
     print()
 
-    # Gold/Silver
-    if latest.get('gsr') and prev.get('gsr'):
-        gsr_chg = latest['gsr'] - prev['gsr']
+    if latest.get("gsr") is not None and prev.get("gsr") is not None:
+        gsr_chg = latest["gsr"] - prev["gsr"]
         direction = "+" if gsr_chg >= 0 else ""
         print(f"- **Gold/Silver Ratio:** {latest['gsr']:.1f} ({direction}{gsr_chg:.2f})")
-        print(f"  - Gold: ${latest['gold']:,.2f} | Silver: ${latest['silver']:.2f}")
+        if latest.get("gold") is not None and latest.get("silver") is not None:
+            print(f"  - Gold: ${latest['gold']:,.2f} | Silver: ${latest['silver']:.2f}")
 
-    # Dow/Gold
-    if latest.get('dow_gold') and prev.get('dow_gold'):
-        dg_chg = latest['dow_gold'] - prev['dow_gold']
+    if latest.get("dow_gold") is not None and prev.get("dow_gold") is not None:
+        dg_chg = latest["dow_gold"] - prev["dow_gold"]
         direction = "+" if dg_chg >= 0 else ""
         print(f"- **Dow/Gold Ratio:** {latest['dow_gold']:.2f} ({direction}{dg_chg:.3f})")
-        print(f"  - Dow: {latest['dow']:,.2f} | Gold: ${latest['gold']:,.2f}")
+        if latest.get("dow") is not None and latest.get("gold") is not None:
+            print(f"  - Dow: {latest['dow']:,.2f} | Gold: ${latest['gold']:,.2f}")
+    elif latest.get("dow_gold") is None:
+        print("- **Dow/Gold Ratio:** N/A (index data missing for this date)")
 
-    # S&P/Gold
-    if latest.get('sp500_gold') and prev.get('sp500_gold'):
-        sg_chg = latest['sp500_gold'] - prev['sp500_gold']
+    if latest.get("sp500_gold") is not None and prev.get("sp500_gold") is not None:
+        sg_chg = latest["sp500_gold"] - prev["sp500_gold"]
         direction = "+" if sg_chg >= 0 else ""
         print(f"- **S&P 500/Gold Ratio:** {latest['sp500_gold']:.4f} ({direction}{sg_chg:.4f})")
-        print(f"  - S&P 500: {latest['sp500']:,.2f} | Gold: ${latest['gold']:,.2f}")
+        if latest.get("sp500") is not None and latest.get("gold") is not None:
+            print(f"  - S&P 500: {latest['sp500']:,.2f} | Gold: ${latest['gold']:,.2f}")
+    elif latest.get("sp500_gold") is None:
+        print("- **S&P 500/Gold Ratio:** N/A (index data missing for this date)")
 
-    # Context
     print()
     if len(history) >= 252:
         year_ago = history[-252]
-        if year_ago.get('dow_gold') and latest.get('dow_gold'):
-            ytd_chg = ((latest['dow_gold'] / year_ago['dow_gold']) - 1) * 100
+        if year_ago.get("dow_gold") and latest.get("dow_gold"):
+            ytd_chg = ((latest["dow_gold"] / year_ago["dow_gold"]) - 1) * 100
             print(f"- Dow/Gold 1-year change: {ytd_chg:+.1f}% (from {year_ago['dow_gold']:.2f})")
-        if year_ago.get('gsr') and latest.get('gsr'):
-            gsr_ytd = ((latest['gsr'] / year_ago['gsr']) - 1) * 100
+        if year_ago.get("gsr") and latest.get("gsr"):
+            gsr_ytd = ((latest["gsr"] / year_ago["gsr"]) - 1) * 100
             print(f"- GSR 1-year change: {gsr_ytd:+.1f}% (from {year_ago['gsr']:.1f})")
 
+    print()
+    print("_Educational context only — not investment advice. See DISCLAIMER.md._")
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Market Ratios Data Collector - Gold, Silver, Dow, S&P 500 with ratio calculations',
+        description="Market Ratios Data Collector - Gold, Silver, Dow, S&P 500 with ratio calculations",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -325,38 +417,49 @@ Examples:
   Briefing output:       python3 market_ratios_collector.py --briefing
   Export to CSV:         python3 market_ratios_collector.py --csv
   Export to path:        python3 market_ratios_collector.py --csv /path/to/output.csv
-        """
+        """,
     )
-    parser.add_argument('--backfill', action='store_true',
-                        help='Pull full historical data (run once to initialize)')
-    parser.add_argument('--start', type=str, default=DEFAULT_START,
-                        help=f'Start date for backfill (default: {DEFAULT_START})')
-    parser.add_argument('--status', action='store_true',
-                        help='Show current data status and exit')
-    parser.add_argument('--briefing', action='store_true',
-                        help='Output market briefing summary (for inclusion in reports)')
-    parser.add_argument('--csv', nargs='?', const='', default=None,
-                        help='Export history to CSV (optional: specify output path)')
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Pull full historical data (run once to initialize)",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=DEFAULT_START,
+        help=f"Start date for backfill (default: {DEFAULT_START})",
+    )
+    parser.add_argument("--status", action="store_true", help="Show current data status and exit")
+    parser.add_argument(
+        "--briefing",
+        action="store_true",
+        help="Output market briefing summary (for inclusion in reports)",
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="?",
+        const="",
+        default=None,
+        help="Export history to CSV (optional: specify output path)",
+    )
 
     args = parser.parse_args()
 
     if args.status:
         show_status()
         return
-
     if args.briefing:
         show_briefing()
         return
-
     if args.csv is not None:
         export_csv(args.csv if args.csv else None)
         return
-
     if args.backfill:
         backfill(args.start)
     else:
         daily_update()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

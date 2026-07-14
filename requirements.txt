@@ -1,0 +1,12 @@
+# GoldenRatios — install into a project venv (recommended):
+#   python3 -m venv .venv
+#   .venv/bin/pip install -U pip
+#   .venv/bin/pip install -r requirements.txt
+#
+# System matplotlib + user-site numpy 2.x can conflict; prefer the venv.
+
+yfinance>=0.2.40
+pandas>=2.0
+matplotlib>=3.7
+numpy>=1.24,<2.0
+fredapi>=0.5.1

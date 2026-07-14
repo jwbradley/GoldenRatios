@@ -1,3 +1,31 @@
+# Generated market data (large / personal runs — do not publish by default)
 *.json
 *.csv
+!package.json
+
+# Charts and runtime logs
+*.png
+logs/
+GSR_chart.png
+
+# Secrets
 .fred_api_key
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.Python
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+*.local.md
